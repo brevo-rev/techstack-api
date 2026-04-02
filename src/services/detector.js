@@ -400,11 +400,22 @@ async function detectFromBrowser(url) {
       }
     });
 
-    // Navigate with shorter timeout, don't wait for full network idle
-    await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 15000
-    });
+    // Retry navigation up to 2 times with increasing timeout
+    const timeouts = [30000, 45000];
+    let lastError = null;
+    for (const timeout of timeouts) {
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout
+        });
+        lastError = null;
+        break;
+      } catch (navErr) {
+        lastError = navErr;
+      }
+    }
+    if (lastError) throw lastError;
 
     // Brief wait for scripts to load
     await page.waitForTimeout(2000);
