@@ -10,6 +10,9 @@ import dns from 'dns/promises';
 // Detection signatures organized by category
 import { SIGNATURES } from '../data/signatures.js';
 import { calculateTechScore } from './scoring.js';
+import { detectFromBuiltWith } from './builtwith.js';
+import { log } from './logger.js';
+import { isDowngraded, recordBrowserAttempt, recordBrowserFailure } from './banTracker.js';
 
 // Browser recycling - prevents memory bloat
 let browserInstance = null;
@@ -51,14 +54,49 @@ export async function closeBrowser() {
  * @param {object} options - Detection options
  * @param {boolean} options.fastMode - Skip browser, DNS-only (much faster)
  * @param {boolean} options.smartMode - DNS first, full scan if high score
+ * @param {boolean} options.useBuiltWith - Include BuiltWith API as additional detection layer
  */
 export async function detectTechStack(domain, options = {}) {
-  const { fastMode = false, smartMode = false } = options;
+  const { fastMode = false, smartMode = false, useBuiltWith = false } = options;
   const url = `https://${domain}`;
+
+  // Auto-downgrade: domain has 3+ browser failures in the last 6 hours
+  if (!fastMode && isDowngraded(domain)) {
+    const autoBuiltWith = useBuiltWith || !!process.env.BUILTWITH_API_KEY;
+    const tasks = [detectFromDNS(domain)];
+    if (autoBuiltWith) tasks.push(safeBuiltWith(domain));
+    const [dnsResults, bwResults] = await Promise.all(tasks);
+    const result = {
+      esp: dnsResults.esp,
+      crm: dnsResults.crm,
+      cms: [],
+      ecommerce: [],
+      analytics: [],
+      cdn: dnsResults.cdn,
+      marketing: [],
+      chat: [],
+      ab_testing: [],
+      tag_manager: [],
+      payment: [],
+      hosting: dnsResults.hosting,
+      dns_records: dnsResults.raw,
+      detection_methods: { dns: true, html: false, headers: false, javascript: false, builtwith: !!bwResults },
+      mode: 'fast',
+      auto_downgraded: true,
+      downgrade_reason: 'browser_banned'
+    };
+    if (bwResults) mergeBuiltWithInto(result, bwResults);
+    const scoring = calculateTechScore(result);
+    return { ...scoring, ...result };
+  }
 
   // Fast mode: DNS-only detection (500ms vs 15s)
   if (fastMode) {
-    const dnsResults = await detectFromDNS(domain);
+    const tasks = [detectFromDNS(domain)];
+    if (useBuiltWith) tasks.push(safeBuiltWith(domain));
+
+    const [dnsResults, bwResults] = await Promise.all(tasks);
+
     const result = {
       esp: dnsResults.esp,
       crm: dnsResults.crm,
@@ -77,17 +115,25 @@ export async function detectTechStack(domain, options = {}) {
         dns: true,
         html: false,
         headers: false,
-        javascript: false
+        javascript: false,
+        builtwith: !!bwResults
       },
       mode: 'fast'
     };
+
+    if (bwResults) mergeBuiltWithInto(result, bwResults);
+
     const scoring = calculateTechScore(result);
     return { ...scoring, ...result };
   }
 
   // Smart mode: DNS first, upgrade to full if score >= 15
   if (smartMode) {
-    const dnsResults = await detectFromDNS(domain);
+    const tasks = [detectFromDNS(domain)];
+    if (useBuiltWith) tasks.push(safeBuiltWith(domain));
+
+    const [dnsResults, bwResults] = await Promise.all(tasks);
+
     const dnsOnlyResult = {
       esp: dnsResults.esp,
       crm: dnsResults.crm,
@@ -106,34 +152,40 @@ export async function detectTechStack(domain, options = {}) {
         dns: true,
         html: false,
         headers: false,
-        javascript: false
+        javascript: false,
+        builtwith: !!bwResults
       }
     };
+
+    if (bwResults) mergeBuiltWithInto(dnsOnlyResult, bwResults);
+
     const dnsScoring = calculateTechScore(dnsOnlyResult);
 
     // If score >= 15 (high potential), do full browser scan
     if (dnsScoring.tech_score >= 15) {
       try {
+        recordBrowserAttempt();
         const browserResults = await detectFromBrowser(url);
         const fullResult = {
-          esp: mergeDetections(dnsResults.esp, browserResults.esp),
-          crm: mergeDetections(dnsResults.crm, browserResults.crm),
-          cms: browserResults.cms,
-          ecommerce: browserResults.ecommerce,
-          analytics: browserResults.analytics,
-          cdn: mergeDetections(dnsResults.cdn, browserResults.cdn),
-          marketing: browserResults.marketing,
-          chat: browserResults.chat,
-          ab_testing: browserResults.ab_testing,
-          tag_manager: browserResults.tag_manager,
-          payment: browserResults.payment,
-          hosting: dnsResults.hosting,
+          esp: mergeDetections(dnsOnlyResult.esp, browserResults.esp),
+          crm: mergeDetections(dnsOnlyResult.crm, browserResults.crm),
+          cms: mergeDetections(dnsOnlyResult.cms, browserResults.cms),
+          ecommerce: mergeDetections(dnsOnlyResult.ecommerce, browserResults.ecommerce),
+          analytics: mergeDetections(dnsOnlyResult.analytics, browserResults.analytics),
+          cdn: mergeDetections(dnsOnlyResult.cdn, browserResults.cdn),
+          marketing: mergeDetections(dnsOnlyResult.marketing, browserResults.marketing),
+          chat: mergeDetections(dnsOnlyResult.chat, browserResults.chat),
+          ab_testing: mergeDetections(dnsOnlyResult.ab_testing, browserResults.ab_testing),
+          tag_manager: mergeDetections(dnsOnlyResult.tag_manager, browserResults.tag_manager),
+          payment: mergeDetections(dnsOnlyResult.payment, browserResults.payment),
+          hosting: dnsOnlyResult.hosting,
           dns_records: dnsResults.raw,
           detection_methods: {
             dns: true,
             html: true,
             headers: browserResults.headersChecked,
-            javascript: browserResults.jsChecked
+            javascript: browserResults.jsChecked,
+            builtwith: !!bwResults
           },
           mode: 'smart-full',
           upgraded: true,
@@ -142,7 +194,8 @@ export async function detectTechStack(domain, options = {}) {
         const fullScoring = calculateTechScore(fullResult);
         return { ...fullScoring, ...fullResult };
       } catch (err) {
-        // Browser failed, return DNS results
+        const reason = err.message.includes('timeout') ? 'timeout' : err.message.includes('403') ? '403' : 'unknown';
+        recordBrowserFailure(domain, reason);
         return { ...dnsScoring, ...dnsOnlyResult, mode: 'smart-dns', upgrade_failed: err.message };
       }
     }
@@ -151,12 +204,13 @@ export async function detectTechStack(domain, options = {}) {
     return { ...dnsScoring, ...dnsOnlyResult, mode: 'smart-dns', skipped_browser: 'score < 15' };
   }
 
+  // Full mode: DNS + Browser (+ optionally BuiltWith) in parallel
   try {
-    // Run DNS checks in parallel with browser
-    const [dnsResults, browserResults] = await Promise.all([
-      detectFromDNS(domain),
-      detectFromBrowser(url)
-    ]);
+    recordBrowserAttempt();
+    const tasks = [detectFromDNS(domain), detectFromBrowser(url)];
+    if (useBuiltWith) tasks.push(safeBuiltWith(domain));
+
+    const [dnsResults, browserResults, bwResults] = await Promise.all(tasks);
 
     const result = {
       esp: mergeDetections(dnsResults.esp, browserResults.esp),
@@ -176,22 +230,33 @@ export async function detectTechStack(domain, options = {}) {
         dns: true,
         html: true,
         headers: browserResults.headersChecked,
-        javascript: browserResults.jsChecked
+        javascript: browserResults.jsChecked,
+        builtwith: !!bwResults
       }
     };
 
-    // Calculate tech stack score
+    if (bwResults) mergeBuiltWithInto(result, bwResults);
+
     const scoring = calculateTechScore(result);
     return {
       ...scoring,
       ...result
     };
   } catch (err) {
-    // If browser fails, try DNS-only detection
-    console.error(`Browser detection failed for ${domain}: ${err.message}`);
+    // Record browser failure for ban tracking
+    const reason = err.message.includes('timeout') ? 'timeout' : err.message.includes('403') ? '403' : 'unknown';
+    recordBrowserFailure(domain, reason);
+
+    // If browser fails, try DNS-only + auto-enable BuiltWith if key is configured
+    log.warn('browser_fallback', { domain, error: err.message });
+    const autoBuiltWith = !useBuiltWith && !!process.env.BUILTWITH_API_KEY;
 
     try {
-      const dnsResults = await detectFromDNS(domain);
+      const tasks = [detectFromDNS(domain)];
+      if (useBuiltWith || autoBuiltWith) tasks.push(safeBuiltWith(domain));
+
+      const [dnsResults, bwResults] = await Promise.all(tasks);
+
       const partialResult = {
         esp: dnsResults.esp,
         crm: dnsResults.crm,
@@ -210,20 +275,52 @@ export async function detectTechStack(domain, options = {}) {
           dns: true,
           html: false,
           headers: false,
-          javascript: false
+          javascript: false,
+          builtwith: !!(useBuiltWith || bwResults)
         },
         partial: true,
-        error: `Browser detection failed: ${err.message}`
+        ...(autoBuiltWith && { builtwith_auto: true }),
+        error: `Browser detection failed: ${err.message}${autoBuiltWith ? ' — enriched via BuiltWith fallback' : ''}`
       };
 
-      // Calculate tech stack score
+      if (bwResults) mergeBuiltWithInto(partialResult, bwResults);
+
       const scoring = calculateTechScore(partialResult);
-      return {
-        ...scoring,
-        ...partialResult
-      };
+      return { ...scoring, ...partialResult };
     } catch (dnsErr) {
       throw new Error(`All detection methods failed: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Safe wrapper — BuiltWith failure should never block other detection methods
+ */
+async function safeBuiltWith(domain) {
+  const start = Date.now();
+  try {
+    const result = await detectFromBuiltWith(domain);
+    log.info('builtwith_complete', { domain, duration_ms: Date.now() - start });
+    return result;
+  } catch (err) {
+    log.error('builtwith_failed', { domain, error: err.message, duration_ms: Date.now() - start });
+    return null;
+  }
+}
+
+const MERGE_CATEGORIES = [
+  'esp', 'crm', 'cms', 'ecommerce', 'analytics',
+  'marketing', 'chat', 'ab_testing', 'tag_manager',
+  'payment', 'cdn', 'hosting'
+];
+
+/**
+ * Merge BuiltWith results into an existing result object (mutates target)
+ */
+function mergeBuiltWithInto(target, bwResults) {
+  for (const cat of MERGE_CATEGORIES) {
+    if (bwResults[cat]?.length) {
+      target[cat] = mergeDetections(target[cat] || [], bwResults[cat]);
     }
   }
 }
@@ -232,6 +329,7 @@ export async function detectTechStack(domain, options = {}) {
  * DNS-based detection (MX, TXT, CNAME records)
  */
 async function detectFromDNS(domain) {
+  const start = Date.now();
   const results = {
     esp: [],
     crm: [],
@@ -357,6 +455,7 @@ async function detectFromDNS(domain) {
     }
   }
 
+  log.info('dns_complete', { domain, duration_ms: Date.now() - start, esp_found: results.esp.length, cdn_found: results.cdn.length, hosting_found: results.hosting.length });
   return results;
 }
 
@@ -364,6 +463,7 @@ async function detectFromDNS(domain) {
  * Browser-based detection (HTML, headers, JavaScript)
  */
 async function detectFromBrowser(url) {
+  const start = Date.now();
   const results = {
     esp: [],
     crm: [],
@@ -466,8 +566,13 @@ async function detectFromBrowser(url) {
     if (context) {
       await context.close().catch(() => {});
     }
+    log.error('browser_failed', { url, error: err.message, duration_ms: Date.now() - start });
     throw err;
   }
+
+  const totalFound = ['esp', 'crm', 'cms', 'ecommerce', 'analytics', 'marketing', 'chat', 'ab_testing', 'tag_manager', 'payment', 'cdn']
+    .reduce((sum, cat) => sum + results[cat].length, 0);
+  log.info('browser_complete', { url, duration_ms: Date.now() - start, total_detections: totalFound, headers_checked: results.headersChecked, js_checked: results.jsChecked });
 
   return results;
 }
