@@ -3,7 +3,6 @@
  * Multi-method website technology detection
  */
 
-import 'dotenv/config';
 import express from 'express';
 import { detectTechStack, closeBrowser } from './services/detector.js';
 import { getCache, setCache, getCacheStats, clearCache } from './services/cache.js';
