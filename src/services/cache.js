@@ -5,6 +5,7 @@
 
 const cache = new Map();
 const DEFAULT_TTL_HOURS = 24;
+const MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES) || 5000;
 
 /**
  * Get cached result if not expired
@@ -33,6 +34,10 @@ export function getCache(domain) {
  * Store result in cache
  */
 export function setCache(domain, data) {
+  if (cache.size >= MAX_ENTRIES) {
+    // Evict oldest entry (Maps preserve insertion order)
+    cache.delete(cache.keys().next().value);
+  }
   cache.set(domain, {
     data,
     timestamp: Date.now()
@@ -44,8 +49,7 @@ export function setCache(domain, data) {
  */
 export function getCacheStats() {
   return {
-    entries: cache.size,
-    domains: Array.from(cache.keys())
+    entries: cache.size
   };
 }
 

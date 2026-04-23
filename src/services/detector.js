@@ -14,10 +14,24 @@ import { detectFromBuiltWith } from './builtwith.js';
 import { log } from './logger.js';
 import { isDowngraded, recordBrowserAttempt, recordBrowserFailure } from './banTracker.js';
 
-// Browser recycling - prevents memory bloat
+// Browser recycling - prevents memory bloat on 512MB instances
 let browserInstance = null;
 let requestCount = 0;
-const MAX_REQUESTS_PER_BROWSER = 50;
+let browserIdleTimer = null;
+const MAX_REQUESTS_PER_BROWSER = 20;
+const BROWSER_IDLE_MS = 5 * 60 * 1000; // close after 5 min idle
+
+function resetIdleTimer() {
+  if (browserIdleTimer) clearTimeout(browserIdleTimer);
+  browserIdleTimer = setTimeout(async () => {
+    if (browserInstance) {
+      log.info('browser_idle_close', { requests_served: requestCount });
+      await browserInstance.close().catch(() => {});
+      browserInstance = null;
+      requestCount = 0;
+    }
+  }, BROWSER_IDLE_MS);
+}
 
 /**
  * Get or create browser instance with recycling
@@ -25,16 +39,17 @@ const MAX_REQUESTS_PER_BROWSER = 50;
 async function getBrowser() {
   if (!browserInstance || requestCount >= MAX_REQUESTS_PER_BROWSER) {
     if (browserInstance) {
-      console.log(`Recycling browser after ${requestCount} requests`);
+      log.info('browser_recycle', { requests_served: requestCount });
       await browserInstance.close().catch(() => {});
     }
     browserInstance = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
     requestCount = 0;
   }
   requestCount++;
+  resetIdleTimer();
   return browserInstance;
 }
 
@@ -42,6 +57,7 @@ async function getBrowser() {
  * Cleanup browser on shutdown
  */
 export async function closeBrowser() {
+  if (browserIdleTimer) clearTimeout(browserIdleTimer);
   if (browserInstance) {
     await browserInstance.close().catch(() => {});
     browserInstance = null;
@@ -62,11 +78,9 @@ export async function detectTechStack(domain, options = {}) {
 
   // Auto-downgrade: domain has 3+ browser failures in the last 6 hours
   if (!fastMode && isDowngraded(domain)) {
-    const autoBuiltWith = useBuiltWith || !!process.env.BUILTWITH_API_KEY;
-    const tasks = [detectFromDNS(domain)];
-    if (autoBuiltWith) tasks.push(safeBuiltWith(domain));
-    const [dnsResults, bwResults] = await Promise.all(tasks);
-    const result = {
+    // DNS first — need score before deciding on BuiltWith
+    const dnsResults = await detectFromDNS(domain);
+    const dnsOnlyResult = {
       esp: dnsResults.esp,
       crm: dnsResults.crm,
       cms: [],
@@ -80,14 +94,24 @@ export async function detectTechStack(domain, options = {}) {
       payment: [],
       hosting: dnsResults.hosting,
       dns_records: dnsResults.raw,
-      detection_methods: { dns: true, html: false, headers: false, javascript: false, builtwith: !!bwResults },
+      detection_methods: { dns: true, html: false, headers: false, javascript: false, builtwith: false },
       mode: 'fast',
       auto_downgraded: true,
       downgrade_reason: 'browser_banned'
     };
-    if (bwResults) mergeBuiltWithInto(result, bwResults);
-    const scoring = calculateTechScore(result);
-    return { ...scoring, ...result };
+    const dnsScoring = calculateTechScore(dnsOnlyResult);
+
+    // Only use BuiltWith for domains worth pursuing (score >= 15)
+    const autoBuiltWith = !useBuiltWith && dnsScoring.tech_score >= 15 && !!process.env.BUILTWITH_API_KEY;
+    let bwResults = null;
+    if (useBuiltWith || autoBuiltWith) bwResults = await safeBuiltWith(domain);
+
+    if (bwResults) mergeBuiltWithInto(dnsOnlyResult, bwResults);
+    dnsOnlyResult.detection_methods.builtwith = !!(useBuiltWith || bwResults);
+    if (autoBuiltWith && bwResults) dnsOnlyResult.builtwith_auto = true;
+
+    const scoring = calculateTechScore(dnsOnlyResult);
+    return { ...scoring, ...dnsOnlyResult };
   }
 
   // Fast mode: DNS-only detection (500ms vs 15s)
@@ -196,7 +220,22 @@ export async function detectTechStack(domain, options = {}) {
       } catch (err) {
         const reason = err.message.includes('timeout') ? 'timeout' : err.message.includes('403') ? '403' : 'unknown';
         recordBrowserFailure(domain, reason);
-        return { ...dnsScoring, ...dnsOnlyResult, mode: 'smart-dns', upgrade_failed: err.message };
+        // dnsScoring.tech_score >= 15 is already guaranteed (that's why we upgraded)
+        // auto-enable BuiltWith as fallback since browser was blocked on a valuable domain
+        const autoBuiltWith = !useBuiltWith && !!process.env.BUILTWITH_API_KEY;
+        let upgradeBwResults = null;
+        if (autoBuiltWith) {
+          upgradeBwResults = await safeBuiltWith(domain);
+          if (upgradeBwResults) mergeBuiltWithInto(dnsOnlyResult, upgradeBwResults);
+        }
+        return {
+          ...dnsScoring,
+          ...dnsOnlyResult,
+          mode: 'smart-dns',
+          upgrade_failed: err.message,
+          ...(autoBuiltWith && upgradeBwResults && { builtwith_auto: true }),
+          detection_methods: { ...dnsOnlyResult.detection_methods, builtwith: !!(useBuiltWith || upgradeBwResults) }
+        };
       }
     }
 
@@ -247,15 +286,11 @@ export async function detectTechStack(domain, options = {}) {
     const reason = err.message.includes('timeout') ? 'timeout' : err.message.includes('403') ? '403' : 'unknown';
     recordBrowserFailure(domain, reason);
 
-    // If browser fails, try DNS-only + auto-enable BuiltWith if key is configured
+    // If browser fails, run DNS first then decide on BuiltWith based on score
     log.warn('browser_fallback', { domain, error: err.message });
-    const autoBuiltWith = !useBuiltWith && !!process.env.BUILTWITH_API_KEY;
 
     try {
-      const tasks = [detectFromDNS(domain)];
-      if (useBuiltWith || autoBuiltWith) tasks.push(safeBuiltWith(domain));
-
-      const [dnsResults, bwResults] = await Promise.all(tasks);
+      const dnsResults = await detectFromDNS(domain);
 
       const partialResult = {
         esp: dnsResults.esp,
@@ -271,19 +306,23 @@ export async function detectTechStack(domain, options = {}) {
         payment: [],
         hosting: dnsResults.hosting,
         dns_records: dnsResults.raw,
-        detection_methods: {
-          dns: true,
-          html: false,
-          headers: false,
-          javascript: false,
-          builtwith: !!(useBuiltWith || bwResults)
-        },
+        detection_methods: { dns: true, html: false, headers: false, javascript: false, builtwith: false },
         partial: true,
-        ...(autoBuiltWith && { builtwith_auto: true }),
-        error: `Browser detection failed: ${err.message}${autoBuiltWith ? ' — enriched via BuiltWith fallback' : ''}`
+        error: `Browser detection failed: ${err.message}`
       };
 
+      // Only use BuiltWith for domains worth pursuing (score >= 15)
+      const dnsScoring = calculateTechScore(partialResult);
+      const autoBuiltWith = !useBuiltWith && dnsScoring.tech_score >= 15 && !!process.env.BUILTWITH_API_KEY;
+      let bwResults = null;
+      if (useBuiltWith || autoBuiltWith) bwResults = await safeBuiltWith(domain);
+
       if (bwResults) mergeBuiltWithInto(partialResult, bwResults);
+      partialResult.detection_methods.builtwith = !!(useBuiltWith || bwResults);
+      if (autoBuiltWith && bwResults) {
+        partialResult.builtwith_auto = true;
+        partialResult.error += ' — enriched via BuiltWith fallback';
+      }
 
       const scoring = calculateTechScore(partialResult);
       return { ...scoring, ...partialResult };

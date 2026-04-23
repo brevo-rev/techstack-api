@@ -410,7 +410,11 @@ export const SIGNATURES = {
       'Agile CRM': ['agilecrm.com'],
       'SugarCRM': ['sugarcrm.com'],
       'Vtiger': ['vtiger.com'],
-      'Bitrix24': ['bitrix24.com']
+      'Bitrix24': ['bitrix24.com'],
+      'ServiceNow': ['servicenow.com', 'service-now.com'],
+      'Veeva CRM': ['veeva.com'],
+      'Oracle CX': ['oracle.com/cx', 'eloqua.com', 'rightnow.com'],
+      'SAP CRM': ['sap.com/crm', 'sapcrm']
     },
     inline: {
       'Salesforce': ['salesforce', 'sfdc', 'pardot'],
@@ -424,13 +428,25 @@ export const SIGNATURES = {
       'Salesforce': ['salesforce.com', 'force.com', 'pardot.com'],
       'HubSpot CRM': ['hubspot.com', 'hs-sites.com'],
       'Marketo': ['marketo.com', 'mktoweb.com', 'mktossl.com'],
-      'Pardot': ['pardot.com', 'go.pardot.com']
+      'Pardot': ['pardot.com', 'go.pardot.com'],
+      'Microsoft Dynamics': ['dynamics.com', 'crm.dynamics', 'd365'],
+      'Zendesk': ['zendesk.com', 'zdassets.com'],
+      'Freshsales': ['freshsales.io', 'freshworks.com'],
+      'Pipedrive': ['pipedrive.com'],
+      'ServiceNow': ['servicenow.com', 'service-now.com'],
+      'Veeva CRM': ['veeva.com'],
+      'SAP CRM': ['sap.com', 'sapcrm']
     },
     txt: {
       'Salesforce': ['salesforce', 'pardot'],
       'HubSpot CRM': ['hubspot'],
       'Marketo': ['marketo'],
-      'Microsoft Dynamics': ['dynamics']
+      'Microsoft Dynamics': ['dynamics', 'dynamics365'],
+      'Zendesk': ['zendesk'],
+      'Freshsales': ['freshsales', 'freshworks'],
+      'Pipedrive': ['pipedrive'],
+      'ServiceNow': ['servicenow'],
+      'SAP CRM': ['sap.com']
     }
   },
 
