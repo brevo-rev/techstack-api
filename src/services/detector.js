@@ -21,6 +21,27 @@ let browserIdleTimer = null;
 const MAX_REQUESTS_PER_BROWSER = 20;
 const BROWSER_IDLE_MS = 5 * 60 * 1000; // close after 5 min idle
 
+// Concurrency semaphore — only 1 browser session at a time on 512MB instances
+let browserBusy = false;
+const browserQueue = [];
+
+async function acquireBrowserSlot() {
+  if (!browserBusy) {
+    browserBusy = true;
+    return;
+  }
+  await new Promise(resolve => browserQueue.push(resolve));
+  browserBusy = true;
+}
+
+function releaseBrowserSlot() {
+  if (browserQueue.length > 0) {
+    browserQueue.shift()();
+  } else {
+    browserBusy = false;
+  }
+}
+
 function resetIdleTimer() {
   if (browserIdleTimer) clearTimeout(browserIdleTimer);
   browserIdleTimer = setTimeout(async () => {
@@ -44,7 +65,19 @@ async function getBrowser() {
     }
     browserInstance = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-default-apps',
+        '--no-first-run',
+        '--disable-breakpad'
+      ]
     });
     requestCount = 0;
   }
@@ -521,6 +554,7 @@ async function detectFromBrowser(url) {
 
   let context = null;
 
+  await acquireBrowserSlot();
   try {
     const browser = await getBrowser();
 
@@ -605,10 +639,12 @@ async function detectFromBrowser(url) {
     if (context) {
       await context.close().catch(() => {});
     }
+    releaseBrowserSlot();
     log.error('browser_failed', { url, error: err.message, duration_ms: Date.now() - start });
     throw err;
   }
 
+  releaseBrowserSlot();
   const totalFound = ['esp', 'crm', 'cms', 'ecommerce', 'analytics', 'marketing', 'chat', 'ab_testing', 'tag_manager', 'payment', 'cdn']
     .reduce((sum, cat) => sum + results[cat].length, 0);
   log.info('browser_complete', { url, duration_ms: Date.now() - start, total_detections: totalFound, headers_checked: results.headersChecked, js_checked: results.jsChecked });
